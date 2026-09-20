@@ -12,6 +12,14 @@ from multiprocessing import Queue
 import signal
 from memento.OCR import Tesseract
 from memento.caching import MetadataCache
+from memento.policy import (
+    CapturePolicy,
+    CaptureContext,
+    apply_redaction,
+    write_governance_marker,
+    is_governed,
+)
+from memento.egress import EgressPolicy
 from langchain.embeddings.openai import OpenAIEmbeddings
 from memento.db import Db
 from langchain.vectorstores import Chroma
@@ -20,6 +28,7 @@ from memento.segments import AppSegments
 
 class Background:
     def __init__(self):
+        fresh_start = True
         if os.path.exists(os.path.join(utils.CACHE_PATH, "0.json")):
             print("EXISTING MEMENTO CACHE FOUND")
             print("Continue this recording or erase and start over ? ")
@@ -31,6 +40,7 @@ class Background:
                 choice = input("Choice: ")
 
             if choice == "1":
+                fresh_start = False
                 self.nb_rec = len(
                     [f for f in os.listdir(utils.CACHE_PATH) if f.endswith(".mp4")]
                 )
@@ -42,6 +52,15 @@ class Background:
         else:
             self.nb_rec = 0
             self.frame_i = 0
+
+        # Only new recordings are governed by the capture policy; legacy
+        # caches without the governance marker keep their existing behavior.
+        if fresh_start:
+            self.policy = CapturePolicy.load(governed=True)
+            write_governance_marker(self.policy)
+        else:
+            self.policy = CapturePolicy.load(governed=is_governed())
+        self.egress = EgressPolicy.from_config(self.policy.config)
 
         self.metadata_cache = MetadataCache()
 
@@ -135,34 +154,71 @@ class Background:
             (utils.RESOLUTION[1], utils.RESOLUTION[0], 3), dtype=np.uint8
         )
         while self.running:
-            window_title = utils.get_active_window()
+            window_info = utils.get_active_window_info(self.sct.monitors)
+            window_title = window_info["app"]
 
-            # Get screenshot and add it to recorder
+            # Get screenshot. The capture event is: identity inputs + pixels.
             im = np.array(self.sct.grab(self.sct.monitors[1]))
             im = im[:, :, :-1]
             im = cv2.resize(im, utils.RESOLUTION)
-            asyncio.run(self.rec.new_im(im))
 
-            # Create metadata
-            t = json.dumps(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            self.images_queue.put(
-                {
-                    "im": im,
-                    "prev_im": prev_im,
-                    "window_title": window_title,
+            # Unified decision point, evaluated before any fan-out
+            now = datetime.datetime.now()
+            t = json.dumps(now.strftime("%Y-%m-%d %H:%M:%S"))
+            decision = self.policy.decide(
+                CaptureContext(
+                    app=window_info["app"],
+                    title=window_info["title"],
+                    display=window_info["display"],
+                    moment=now,
+                )
+            )
+
+            if decision.dropped:
+                # No pixels are encoded, OCR'd or queued. Only a time gap is
+                # recorded; it deliberately contains no window title.
+                gap_metadata = {
                     "time": t,
-                    "frame_i": self.frame_i,
+                    "decision": utils.DECISION_DROP,
                 }
-            )
-            prev_im = im
+                if decision.rule_id is not None:
+                    gap_metadata["rule_id"] = decision.rule_id
+                self.metadata_cache.write(self.frame_i, gap_metadata)
 
-            self.metadata_cache.write(
-                self.frame_i,
-                {
+            else:
+                if decision.redacted:
+                    # Modify the raw pixels before encoding, OCR and
+                    # cross-process queueing
+                    apply_redaction(
+                        im, decision.regions, self.policy.redaction_mode
+                    )
+
+                asyncio.run(self.rec.new_im(im))
+
+                self.images_queue.put(
+                    {
+                        "im": im,
+                        "prev_im": prev_im,
+                        "window_title": window_title,
+                        "time": t,
+                        "frame_i": self.frame_i,
+                    }
+                )
+                prev_im = im
+
+                frame_metadata = {
                     "window_title": window_title,
                     "time": t,
-                },
-            )
+                }
+                if self.policy.governed:
+                    frame_metadata["decision"] = decision.action
+                    if decision.rule_id is not None:
+                        frame_metadata["rule_id"] = decision.rule_id
+                    if decision.redacted:
+                        frame_metadata["regions"] = [
+                            list(r) for r in decision.regions
+                        ]
+                self.metadata_cache.write(self.frame_i, frame_metadata)
 
             # deque results
             getting = True
@@ -235,9 +291,11 @@ class Background:
                                 for _ in range(len(all_texts))
                             ]
                             if self.chromadb is not None:
+                                # Egress policy: only allowlisted metadata
+                                # fields are sent to the embedding service
                                 self.chromadb.add_texts(
                                     texts=all_texts,
-                                    metadatas=md,
+                                    metadatas=self.egress.filter_metadatas(md),
                                 )
                             print("ADDED SEQUENCE ", all_texts)
                         print("ADD TO DB TIME:", time.time() - add_db_start)

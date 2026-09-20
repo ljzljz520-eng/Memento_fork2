@@ -10,8 +10,8 @@ class FrameGetter:
     def __init__(self, window_size):
         self.window_size = window_size
 
-        self.readers_cache = ReadersCache()
         self.metadata_cache = MetadataCache()
+        self.readers_cache = ReadersCache(self.metadata_cache)
         self.annotations = {}
         self.current_ret_annotated = 0
         self.nb_frames = int(
@@ -31,6 +31,44 @@ class FrameGetter:
         self.debug_mode = not self.debug_mode
         self.clear_annotations()
 
+    def is_gap(self, frame_i):
+        # Dropped frames are explicit, non-recorded intervals
+        return self.metadata_cache.is_gap(frame_i)
+
+    def gap_reason(self, frame_i):
+        return self.metadata_cache.gap_reason(frame_i)
+
+    def _make_gap_card(self, frame_i):
+        # Locally synthesized placeholder: it contains no captured pixels
+        card = np.full(
+            (utils.RESOLUTION[1], utils.RESOLUTION[0], 3), 32, dtype=np.uint8
+        )
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(
+            card, "Not recorded", (120, 200), font, 2.5, (220, 220, 220), 4
+        )
+        reason = self.gap_reason(frame_i)
+        if reason:
+            cv2.putText(
+                card,
+                "Policy: " + str(reason),
+                (120, 280),
+                font,
+                1.2,
+                (150, 150, 150),
+                2,
+            )
+        cv2.putText(
+            card,
+            "Preview, copy and search are disabled for this interval",
+            (120, 340),
+            font,
+            0.9,
+            (120, 120, 120),
+            2,
+        )
+        return card
+
     def get_frame(self, frame_i, resize=None):
         im = self.current_displayed_frame
 
@@ -43,9 +81,14 @@ class FrameGetter:
             frame_i != self.current_displayed_frame_i
             or self.current_displayed_frame is None
         ):
-            im = self.readers_cache.get_frame(min(self.nb_frames - 1, frame_i))
-            self.process_debug(frame_i)
-            im = self.annotate_frame(frame_i, im)
+            if self.is_gap(frame_i):
+                im = self._make_gap_card(frame_i)
+            else:
+                im = self.readers_cache.get_frame(
+                    min(self.nb_frames - 1, frame_i)
+                )
+                self.process_debug(frame_i)
+                im = self.annotate_frame(frame_i, im)
             if resize:
                 im = cv2.resize(im, resize)
             else:

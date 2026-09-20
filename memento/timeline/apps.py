@@ -1,6 +1,11 @@
 import numpy as np
 from memento.timeline.icon_getter import IconGetter
+import memento.utils as utils
 import time
+
+# Fixed color for intervals dropped by the capture policy (never assigned to
+# real apps); gap segments have no icon.
+GAP_COLOR = (55, 55, 55)
 
 COLOR_PALETTE = [
     [244, 67, 54],
@@ -39,9 +44,22 @@ class Apps:
         if len(self.ig.icon_cache) == 0 or self.nb_frames < 1000:
             stride = 1
         for i in range(0, self.nb_frames, stride):
-            app = self.metadata_cache.get_frame_metadata(i)["window_title"]
+            entry = self.metadata_cache.get_frame_metadata_or_none(i)
+            app = None
+            if entry is not None:
+                if entry.get("decision") == "drop":
+                    app = utils.GAP_APP
+                else:
+                    app = entry.get("window_title")
+            if app is None:
+                continue
             if app not in self.apps:
                 self.apps[app] = {}
+                if app == utils.GAP_APP:
+                    self.apps[app]["color"] = GAP_COLOR
+                    self.apps[app]["icon_small"] = None
+                    self.apps[app]["icon_big"] = None
+                    continue
                 if len(self.apps) < len(COLOR_PALETTE):
                     self.apps[app]["color"] = tuple(COLOR_PALETTE[len(self.apps)])
                 else:
@@ -51,9 +69,13 @@ class Apps:
                 self.apps[app]["icon_big"] = icon_big
 
     def get_color(self, app):
+        if app not in self.apps:
+            return GAP_COLOR if app == utils.GAP_APP else (180, 180, 180)
         return self.apps[app]["color"]
 
     def get_icon(self, app, small=True):
+        if app not in self.apps:
+            return None
         if small:
             return self.apps[app]["icon_small"]
         else:

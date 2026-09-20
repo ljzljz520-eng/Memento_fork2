@@ -106,15 +106,27 @@ class Timeline:
                     elif not self.chat.active or not self.chat.hover(
                         pygame.mouse.get_pos()
                     ):
-                        self.search_bar.deactivate()
-                        self.region_selector.start(event.pos)
-                        self.time_bar.hide()
+                        if self.frame_getter.is_gap(self.time_bar.current_frame_i):
+                            # Dropped intervals cannot be selected or OCR'd
+                            self.region_selector.reset()
+                            self.popup_manager.add_popup(
+                                "Not recorded: this interval is unavailable",
+                                (50, 70),
+                                2,
+                            )
+                        else:
+                            self.search_bar.deactivate()
+                            self.region_selector.start(event.pos)
+                            self.time_bar.hide()
             if event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     if self.time_bar.hover(event.pos):
                         continue
                     self.time_bar.show()
                     if self.search_bar.active:
+                        continue
+                    if self.frame_getter.is_gap(self.time_bar.current_frame_i):
+                        self.region_selector.reset()
                         continue
                     self.region_selector.end(event.pos)
                     frame = self.frame_getter.get_frame(
@@ -157,13 +169,21 @@ class Timeline:
                 if event.mod & pygame.KMOD_CTRL:
                     self.ctrl_pressed = True
                     if event.key == pygame.K_c:
-                        text = self.frame_getter.get_annotations_text()
-                        pyperclip.copy(text)
-                        self.popup_manager.add_popup(
-                            "Text copied to clipboard",
-                            (50, 70),
-                            2,
-                        )
+                        if self.frame_getter.is_gap(self.time_bar.current_frame_i):
+                            # Gap content is not copyable
+                            self.popup_manager.add_popup(
+                                "Not recorded: nothing to copy",
+                                (50, 70),
+                                2,
+                            )
+                        else:
+                            text = self.frame_getter.get_annotations_text()
+                            pyperclip.copy(text)
+                            self.popup_manager.add_popup(
+                                "Text copied to clipboard",
+                                (50, 70),
+                                2,
+                            )
 
                     if event.key == pygame.K_t:
                         self.chat.activate()

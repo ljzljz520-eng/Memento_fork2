@@ -201,6 +201,14 @@ class SearchBar:
 
         results = self.db.search(query_input)
 
+        # Defense in depth: dropped intervals are never searchable, even if a
+        # stale row somehow exists in the FTS index.
+        results = {
+            frame_id: annotations
+            for frame_id, annotations in results.items()
+            if not self.frame_getter.is_gap(int(frame_id))
+        }
+
         self.frame_getter.set_annotations(results)
         if len(results) > 0:
             self.found = True

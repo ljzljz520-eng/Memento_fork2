@@ -103,19 +103,51 @@ class TimeBar:
 
         self.draw_time(screen, (cursor_x, self.y))
 
-    def draw_bar(self, screen, mouse_pos):
+    def _frame_app(self, i):
+        # Gap frames (dropped by the capture policy) and missing metadata
+        # become the explicit gap sentinel; None means past the live edge.
+        entry = self.metadata_cache.get_frame_metadata_or_none(i)
+        if entry is None:
+            return None
+        if entry.get("decision") == "drop":
+            return utils.GAP_APP
+        return entry.get("window_title", utils.GAP_APP)
+
+    def _build_segments(self):
+        # Walk frames backwards from the live edge to the window start
+        i = self.tw_end
+        while i > self.tw_start and self._frame_app(i) is None:
+            i -= 1
+        if i <= self.tw_start:
+            return []
+
         segments = []
-
-        # Warning, it's backwards
-        last_app = self.metadata_cache.get_frame_metadata(self.tw_end)["window_title"]
-        segments.append({"app": last_app, "start": 0, "end": self.tw_end})
-        for i in range(self.tw_end, self.tw_start, -1):
-            app = self.metadata_cache.get_frame_metadata(i)["window_title"]
-
-            segments[-1]["start"] = i  # current segment
+        last_app = self._frame_app(i)
+        segments.append({"app": last_app, "start": i, "end": i})
+        for j in range(i, self.tw_start - 1, -1):
+            app = self._frame_app(j)
+            if app is None:
+                app = last_app
+            segments[-1]["start"] = j  # current segment
             if app != last_app:
-                segments.append({"app": app, "start": i, "end": i})
+                segments.append({"app": app, "start": j, "end": j})
             last_app = app
+        return segments
+
+    def _draw_gap_hatch(self, screen, seg_x, seg_y, seg_w, seg_h):
+        # Diagonal hatch marks gap intervals as non-content areas
+        step = 12
+        for offset in range(-seg_h, int(seg_w) + seg_h, step):
+            pygame.draw.line(
+                screen,
+                (120, 120, 120),
+                (seg_x + offset, seg_y + seg_h),
+                (seg_x + offset + seg_h, seg_y),
+                1,
+            )
+
+    def draw_bar(self, screen, mouse_pos):
+        segments = self._build_segments()
 
         for segment in segments:
             app = segment["app"]
@@ -123,7 +155,7 @@ class TimeBar:
             end = segment["end"] - self.tw_start
             middle = (start + end) / 2
             seg_x = self.x + (start / self.tws) * self.w
-            seg_w = (end - start) / self.tws * self.w
+            seg_w = max(1, (end - start) / self.tws * self.w)
 
             pygame.draw.rect(
                 screen,
@@ -132,13 +164,18 @@ class TimeBar:
                 border_radius=self.h // 4,
             )
 
+            if app == utils.GAP_APP:
+                self._draw_gap_hatch(
+                    screen, seg_x, self.y, seg_w, self.h
+                )
+
         for segment in segments:
             app = segment["app"]
             start = segment["start"] - self.tw_start
             end = segment["end"] - self.tw_start
             middle = (start + end) / 2
             seg_x = self.x + (start / self.tws) * self.w
-            seg_w = (end - start) / self.tws * self.w
+            seg_w = max(1, (end - start) / self.tws * self.w)
 
             if self.apps.get_icon(app) is not None:
                 if start <= self.current_frame_i <= end or utils.in_rect(
@@ -168,6 +205,10 @@ class TimeBar:
         if not self.hover(mouse_pos):
             return
         frame_i = self.get_frame_i(mouse_pos)
+        # Dropped intervals are never previewable
+        if self.frame_getter.is_gap(frame_i):
+            self.preview_surf = None
+            return
         if frame_i != self.preview_frame_i or self.preview_surf is None:
             self.preview_frame_i = frame_i
             frame = self.frame_getter.get_frame(frame_i)
@@ -185,10 +226,16 @@ class TimeBar:
         if not self.hover(pos):
             return
         frame_i = self.get_frame_i(pos)
-        time = self.metadata_cache.get_frame_metadata(frame_i)["time"].strip('"')
-        time = self.get_friendly_date(time)
+        if self.frame_getter.is_gap(frame_i):
+            # Gaps show the rule hit reason instead of a timestamp/title
+            reason = self.frame_getter.gap_reason(frame_i) or "policy"
+            label = "Not recorded (" + str(reason) + ")"
+        else:
+            entry = self.metadata_cache.get_frame_metadata_or_none(frame_i)
+            time = (entry or {}).get("time", '""').strip('"')
+            label = self.get_friendly_date(time) if time else ""
         font = pygame.font.SysFont("Arial", 20)
-        text = font.render(time, True, (0, 0, 0))
+        text = font.render(label, True, (0, 0, 0))
         text_size = text.get_size()
         border = 10
         pygame.draw.rect(

@@ -11,6 +11,7 @@ from multiprocessing import Queue
 import json
 import memento.timeline.text_utils as text_utils
 import memento.utils as utils
+from memento.egress import EgressPolicy
 import cv2
 import pygame_textinput
 
@@ -50,6 +51,14 @@ class Chat:
         self.frame_peek_w = int(self.w / 3 - self.chatbox_margin * 2)
         self.frames_peeks_rects = {}
         self.frame_peek_hovered_id = None
+
+        # Independent egress policy for metadata sent to the chat LLM
+        self.egress = EgressPolicy()
+        try:
+            with open(utils.POLICY_PATH) as f:
+                self.egress = EgressPolicy.from_config(json.load(f))
+        except Exception:
+            pass
 
         if not self.key_ok:
             self.chromadb = None
@@ -120,13 +129,12 @@ class Chat:
             print("done")
             md = {}
             for doc in docs:
-                frame_id = doc.metadata["id"]
-                window_title = doc.metadata["id"]
-                date = doc.metadata["time"]
-                md[frame_id] = {
-                    "window_title": window_title,
-                    "date": date,
-                }
+                # Egress policy: only allowlisted metadata fields reach the LLM
+                filtered = self.egress.filter_metadata(doc.metadata)
+                frame_id = filtered.get("id")
+                if frame_id is None:
+                    continue
+                md[frame_id] = {"date": filtered.get("time")}
 
             result = self.qa(inputs={"question": inp, "md": md})
 
@@ -339,6 +347,9 @@ class Chat:
             self.chat_history[-1]["answer"] = result["answer"]
             frames_ids = result["frames_ids"]
             for frame_id in frames_ids:
+                # Dropped intervals are never previewed in chat answers
+                if self.frame_getter.is_gap(int(frame_id)):
+                    continue
                 frame = cv2.resize(
                     self.frame_getter.get_frame(int(frame_id)),
                     (self.frame_peek_w, self.frame_peek_w),

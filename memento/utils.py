@@ -1,4 +1,6 @@
 import Xlib.display
+import Xlib.X
+import Xlib.xobject.drawable
 import av
 import fractions
 import time
@@ -19,6 +21,24 @@ MAX_TWS = 10000 * FPS * SECONDS_PER_REC
 FRAME_CACHE_SIZE = int((MAX_TWS / FPS / SECONDS_PER_REC))
 CACHE_PATH = os.path.join(os.environ["HOME"], ".cache", "memento")
 
+# Sentinel stored in place of window_title for frames dropped by the capture
+# policy. Must never collide with a real WM_CLASS.
+GAP_APP = "__memento_gap__"
+DECISION_ALLOW = "allow"
+DECISION_DROP = "drop"
+DECISION_REDACT = "redact"
+
+_CONFIG_HOME = os.environ.get(
+    "XDG_CONFIG_HOME", os.path.join(os.environ["HOME"], ".config")
+)
+CONFIG_PATH = os.path.join(_CONFIG_HOME, "memento")
+POLICY_PATH = os.path.join(CONFIG_PATH, "policy.json")
+GOVERNANCE_MARKER = "governance.json"
+
+
+def normalize_app(app):
+    return (app or "").strip().lower()
+
 
 def get_active_window():
     display = Xlib.display.Display()
@@ -34,6 +54,90 @@ def get_active_window():
         return winclass
     else:
         return "None"
+
+
+def _get_window_title(display, window):
+    # Prefer the UTF-8 _NET_WM_NAME property, fall back to WM_NAME
+    try:
+        atom = display.intern_atom("_NET_WM_NAME")
+        prop = window.get_full_property(atom, Xlib.X.AnyPropertyType)
+        if prop is not None and prop.value:
+            value = prop.value
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="ignore")
+            return str(value)
+    except Exception:
+        pass
+    try:
+        name = window.get_wm_name()
+        if name:
+            if isinstance(name, bytes):
+                return name.decode("utf-8", errors="ignore")
+            return str(name)
+    except Exception:
+        pass
+    return ""
+
+
+def _get_window_display(display, window, monitors):
+    # monitors is the mss monitor list (index 0 is the virtual screen,
+    # physical monitors start at 1). When unavailable, assume monitor 1.
+    if not monitors or len(monitors) <= 1:
+        return 1
+    try:
+        root = display.screen().root
+        coords = window.translate_coords(root, 0, 0)
+        x = getattr(coords, "dst_x", getattr(coords, "x", None))
+        y = getattr(coords, "dst_y", getattr(coords, "y", None))
+        if x is None or y is None:
+            return 1
+        for i in range(1, len(monitors)):
+            m = monitors[i]
+            if (
+                m["left"] <= x < m["left"] + m["width"]
+                and m["top"] <= y < m["top"] + m["height"]
+            ):
+                return i
+    except Exception:
+        pass
+    return 1
+
+
+def get_active_window_info(monitors=None):
+    """Return the normalized identity inputs of the active window.
+
+    Keys: "app" (WM_CLASS instance, kept raw for storage/segment use),
+    "title" (raw _NET_WM_NAME/WM_NAME), "display" (mss monitor index).
+    Normalization for rule matching happens in memento.policy.
+    """
+    display = Xlib.display.Display()
+    try:
+        window = display.get_input_focus().focus
+        if not isinstance(window, Xlib.xobject.drawable.Window):
+            return {"app": "None", "title": "", "display": 1}
+
+        wmclass = window.get_wm_class()
+        if wmclass is None:
+            parent = window.query_tree().parent
+            if isinstance(parent, Xlib.xobject.drawable.Window):
+                wmclass = parent.get_wm_class()
+                window_for_title = parent
+            else:
+                window_for_title = window
+        else:
+            window_for_title = window
+
+        app = wmclass[1] if wmclass is not None else "None"
+        title = _get_window_title(display, window_for_title)
+        display_id = _get_window_display(display, window, monitors)
+        return {"app": app, "title": title, "display": display_id}
+    except Exception:
+        return {"app": "None", "title": "", "display": 1}
+    finally:
+        try:
+            display.close()
+        except Exception:
+            pass
 
 
 # check that a y coordinate is within a line with a tolerance of y_tol
@@ -61,17 +165,30 @@ class Recorder:
     _timestamp: int
 
     def __init__(self, filename):
-        self.output = av.open(filename, "w")
+        self.filename = filename
+        # The container/stream is created lazily: a segment where every frame
+        # is dropped by the capture policy must not contain a single pixel.
+        self.output = None
+        self.stream = None
+        self._start = None
+        self._timestamp = None
+
+    def _ensure_stream(self):
+        if self.output is not None:
+            return
+        self.output = av.open(self.filename, "w")
         self.stream = self.output.add_stream("h264", str(FPS))
         self.stream.height = RESOLUTION[1]
         self.stream.width = RESOLUTION[0]
         self.stream.bit_rate = 8500e1
+        self._start = time.time()
+        self._timestamp = None
 
     def start(self):
         self._start = time.time()
 
     async def next_timestamp(self):
-        if hasattr(self, "_timestamp"):
+        if self._timestamp is not None:
             self._timestamp += int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
             wait = self._start + (self._timestamp / VIDEO_CLOCK_RATE) - time.time()
             await asyncio.sleep(wait)
@@ -81,17 +198,28 @@ class Recorder:
         return self._timestamp, VIDEO_TIME_BASE
 
     async def new_im(self, im):
+        self._ensure_stream()
         pts, time_base = await self.next_timestamp()
         frame = av.video.frame.VideoFrame.from_ndarray(im, format="bgr24")
         frame.pts = pts
         frame.time_base = time_base
         packet = self.stream.encode(frame)
-        self.output.mux(packet)
+        if packet is not None:
+            self.output.mux(packet)
 
     def stop(self):
+        if self.output is None:
+            # Nothing was recorded in this segment: keep an empty placeholder
+            # so segment numbering and the timeline's mp4 count stay consistent
+            with open(self.filename, "wb"):
+                pass
+            return
         packet = self.stream.encode(None)
-        self.output.mux(packet)
+        if packet is not None:
+            self.output.mux(packet)
         self.output.close()
+        self.output = None
+        self.stream = None
 
 
 def in_rect(rect, pos):
